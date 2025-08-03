@@ -101,7 +101,6 @@ def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
     trend_15m = "多頭" if latest_15m['EMA5'] > latest_15m['EMA20'] else "空頭"
     rsi_15m_filter = latest_15m['RSI'] < 70 if trend_15m == "多頭" else latest_15m['RSI'] > 30
     
-    # 策略1：VWAP 錨定趨勢策略
     if (trend_15m == "多頭" and rsi_15m_filter and
         latest_5m['Close'] > latest_5m['VWAP'] and 
         prev_5m['EMA5'] <= prev_5m['EMA20'] and 
@@ -136,7 +135,6 @@ def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
         reward = shares * (entry_price - take_profit)
         rr_ratio = reward / abs(risk) if risk != 0 else float('inf')
     
-    # 策略2：布林帶突破策略
     elif (trend_15m == "多頭" and rsi_15m_filter and
           latest_5m['Close'] > latest_5m['BB_Upper'] and 
           latest_5m['RSI'] < 70 and 
@@ -167,7 +165,6 @@ def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
         reward = shares * (entry_price - take_profit)
         rr_ratio = reward / abs(risk) if risk != 0 else float('inf')
     
-    # 策略3：RSI 反轉策略
     elif (latest_5m['RSI'] > 70 and 
           latest_5m['Close'] > latest_5m['BB_Upper'] and 
           latest_5m['OBV'] < prev_5m['OBV'] and 
@@ -434,7 +431,8 @@ def main():
     st.header("回測結果（過去 5 天）")
     df_5m_backtest = fetch_historical_data(symbol, interval="5m", period="5d")
     df_15m_backtest = fetch_historical_data(symbol, interval="15m", period="5d")
-    if df_5m_backtest is not None and df_15m_backtest is not None:
+    
+    if df_5m_backtest is not None and not df_5m_backtest.empty and df_15m_backtest is not None and not df_15m_backtest.empty:
         df_5m_backtest = calculate_indicators(df_5m_backtest)
         df_15m_backtest = calculate_indicators(df_15m_backtest)
         if df_5m_backtest is not None and df_15m_backtest is not None:
@@ -452,6 +450,8 @@ def main():
                 st.subheader("回測交易詳情")
                 df_trades = pd.DataFrame(trades)
                 st.dataframe(df_trades[['時間', '策略', '信號', '入場價', '止損', '止盈', '盈虧', '風險回報比', '退出原因']])
+    else:
+        st.error("無法獲取回測數據，請檢查網路或稍後重試")
     
     # 實時監控
     placeholder = st.empty()
@@ -460,15 +460,21 @@ def main():
             st.header("實時監控")
             df_5m = fetch_historical_data(symbol, interval="5m", period="1d")
             df_15m = fetch_historical_data(symbol, interval="15m", period="1d")
-            if df_5m is None or df_15m is None:
+            
+            if df_5m is None or df_5m.empty or df_15m is None or df_15m.empty:
+                st.error("實時數據獲取失敗，跳過本次更新")
+                time.sleep(refresh_interval)
+                st.experimental_rerun()
                 continue
             
             df_5m = calculate_indicators(df_5m)
             df_15m = calculate_indicators(df_15m)
             if df_5m is None or df_15m is None:
+                st.error("指標計算失敗，跳過本次更新")
+                time.sleep(refresh_interval)
+                st.experimental_rerun()
                 continue
             
-            # 5 分鐘數據
             st.subheader("5分鐘K線數據")
             latest_5m = df_5m.iloc[-1]
             st.write(f"當前價格 (TSLA): {latest_5m['Close']:.2f} 美元 | 時間: {df_5m.index[-1]}")
@@ -482,19 +488,17 @@ def main():
             col3.metric("OBV", f"{latest_5m['OBV']:.0f}")
             st.plotly_chart(plot_data(df_5m, "5分鐘"), use_container_width=True)
             
-            # 15 分鐘數據
             st.subheader("15分鐘K線數據（趨勢確認）")
             latest_15m = df_15m.iloc[-1]
             st.write(f"趨勢: {'多頭' if latest_15m['EMA5'] > latest_15m['EMA20'] else '空頭'} | 時間: {df_15m.index[-1]}")
             col1, col2, col3 = st.columns(3)
             col1.metric("EMA5", f"{latest_15m['EMA5']:.2f}")
-            col1.metric("EMA20", f"{latest_15m['EMA20']:.2f}")
+            col1.metric("EMA20", f"{latest_5m['EMA20']:.2f}")
             col2.metric("RSI", f"{latest_15m['RSI']:.2f}")
             col3.metric("布林上軌", f"{latest_15m['BB_Upper']:.2f}")
             col3.metric("布林下軌", f"{latest_15m['BB_Lower']:.2f}")
             st.plotly_chart(plot_data(df_15m, "15分鐘"), use_container_width=True)
             
-            # 交易信號
             signal = generate_trading_signal(df_5m, df_15m)
             st.subheader("實時交易策略建議")
             if signal['signal'] != "無交易信號":
@@ -528,13 +532,11 @@ def main():
             else:
                 st.write("當前無明確交易信號，請等待機會。")
             
-            # 信號歷史
             st.subheader("最近交易信號（最多5筆）")
             if st.session_state.signal_history:
                 history_df = pd.DataFrame(st.session_state.signal_history)
                 st.dataframe(history_df[['時間', '策略', '信號', '入場價', '止損', '止盈', '風險回報比']])
             
-            # 下次更新
             st.write(f"下次更新於 {datetime.now() + timedelta(seconds=refresh_interval)}")
         
         time.sleep(refresh_interval)
