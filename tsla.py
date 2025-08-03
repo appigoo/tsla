@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import yfinance as yf
 import plotly.graph_objs as go
 from datetime import datetime, timedelta
@@ -8,6 +7,7 @@ import time
 import ta
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Streamlit 頁面設置
 st.set_page_config(page_title="TSLA 5分鐘交易策略監控與回測", layout="wide")
@@ -19,17 +19,21 @@ if 'signal_history' not in st.session_state:
     st.session_state.signal_history = []
 if 'last_signal' not in st.session_state:
     st.session_state.last_signal = None
-# 新增一個用於控制實時監控循環的 session state
 if 'is_running' not in st.session_state:
     st.session_state.is_running = False
 
 # 獲取歷史數據
 def fetch_historical_data(symbol="TSLA", interval="5m", period="5d"):
     try:
-        df = yf.download(symbol, interval=interval, period=period, prepost=False)
+        # 使用 period 參數來獲取足夠的回測數據
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=5)
+        df = yf.download(symbol, start=start_date, end=end_date, interval=interval, prepost=False, progress=False)
+
         if df.empty:
-            st.warning("無數據返回，請檢查股票代碼或網路連線。")
+            st.warning(f"無數據返回，請檢查股票代碼或網路連線。Code: {symbol}, Period: {period}")
             return None
+        
         df.index = pd.to_datetime(df.index)
         return df
     except Exception as e:
@@ -38,9 +42,11 @@ def fetch_historical_data(symbol="TSLA", interval="5m", period="5d"):
 
 # 計算技術指標
 def calculate_indicators(df):
-    if df is None or len(df) < 21:  # 至少需要21根K線來計算指標
+    if df is None or len(df) < 21:
+        # 指標計算需要至少20根K線，所以我們檢查21
         return None
     try:
+        df = df.copy()  # 避免 SettingWithCopyWarning
         close = df['Close']
         volume = df['Volume']
         
@@ -48,7 +54,6 @@ def calculate_indicators(df):
         df['EMA20'] = ta.trend.ema_indicator(close, window=20)
         df['RSI'] = ta.momentum.rsi(close, window=14)
         
-        # 修正VWAP計算邏輯，確保每個時間點的VWAP都是基於該時間點之前的數據
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         price_volume = typical_price * df['Volume']
         df['VWAP'] = price_volume.cumsum() / df['Volume'].cumsum()
@@ -61,7 +66,6 @@ def calculate_indicators(df):
         df['OBV'] = ta.volume.on_balance_volume(close, volume)
         df['Volume_MA5'] = volume.rolling(window=5).mean()
         
-        # 移除前20行有 NaN 值的數據
         df.dropna(inplace=True)
         return df
     except Exception as e:
@@ -70,10 +74,16 @@ def calculate_indicators(df):
 
 # 發送 email 警報
 def send_email_alert(signal, email_config):
-    if not email_config['enabled'] or not all(email_config.values()):
+    if not email_config['enabled'] or not all([email_config['sender'], email_config['password'], email_config['receiver']]):
         return
+    
     try:
-        msg = MIMEText(
+        msg = MIMEMultipart()
+        msg['Subject'] = f"TSLA 交易信號: {signal['signal']} ({signal['strategy']})"
+        msg['From'] = email_config['sender']
+        msg['To'] = email_config['receiver']
+        
+        body = (
             f"策略: {signal['strategy']}\n"
             f"信號: {signal['signal']}\n"
             f"入場價: {signal['entry_price']:.2f} 美元\n"
@@ -85,9 +95,7 @@ def send_email_alert(signal, email_config):
             f"風險回報比: {signal['rr_ratio']:.2f}\n"
             f"時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        msg['Subject'] = f"TSLA 交易信號: {signal['signal']} ({signal['strategy']})"
-        msg['From'] = email_config['sender']
-        msg['To'] = email_config['receiver']
+        msg.attach(MIMEText(body, 'plain'))
         
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(email_config['sender'], email_config['password'])
@@ -104,15 +112,15 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
     latest_5m = df_5m.iloc[-1]
     prev_5m = df_5m.iloc[-2]
     
-    # 找到與最新5分鐘K線時間點最接近的15分鐘K線
     latest_15m_idx = df_15m.index[df_15m.index <= df_5m.index[-1]].max()
+    if pd.isna(latest_15m_idx):
+        return {"signal": "無交易信號", "strategy": None, "timestamp": datetime.now()}
     latest_15m = df_15m.loc[latest_15m_idx]
 
     signal = "無交易信號"
     strategy = None
-    entry_price = stop_loss = take_profit = risk = reward = rr_ratio = shares = None
+    entry_price = stop_loss_price = take_profit = risk = reward = rr_ratio = shares = None
     
-    # 風險管理
     risk_per_trade = 0.015
     risk_amount = capital * risk_per_trade
     
@@ -132,8 +140,9 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
         entry_price = latest_5m['Close']
         stop_loss_price = max(latest_5m['VWAP'], entry_price - 2)
         take_profit = entry_price + 3.5
-        shares = int(risk_amount / (entry_price - stop_loss_price)) if (entry_price - stop_loss_price) > 0 else 0
-        risk = shares * (entry_price - stop_loss_price)
+        stop_loss_diff = entry_price - stop_loss_price
+        shares = int(risk_amount / stop_loss_diff) if stop_loss_diff > 0 else 0
+        risk = shares * stop_loss_diff
         reward = shares * (take_profit - entry_price)
 
     elif (trend_15m == "空頭" and rsi_15m_filter and
@@ -148,8 +157,9 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
         entry_price = latest_5m['Close']
         stop_loss_price = min(latest_5m['VWAP'], entry_price + 2)
         take_profit = entry_price - 3.5
-        shares = int(risk_amount / (stop_loss_price - entry_price)) if (stop_loss_price - entry_price) > 0 else 0
-        risk = shares * (stop_loss_price - entry_price)
+        stop_loss_diff = stop_loss_price - entry_price
+        shares = int(risk_amount / stop_loss_diff) if stop_loss_diff > 0 else 0
+        risk = shares * stop_loss_diff
         reward = shares * (entry_price - take_profit)
     
     # 策略 2: 布林帶突破策略
@@ -163,8 +173,9 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
         entry_price = latest_5m['Close']
         stop_loss_price = latest_5m['BB_Mid']
         take_profit = entry_price + (entry_price - latest_5m['BB_Mid'])
-        shares = int(risk_amount / (entry_price - stop_loss_price)) if (entry_price - stop_loss_price) > 0 else 0
-        risk = shares * (entry_price - stop_loss_price)
+        stop_loss_diff = entry_price - stop_loss_price
+        shares = int(risk_amount / stop_loss_diff) if stop_loss_diff > 0 else 0
+        risk = shares * stop_loss_diff
         reward = shares * (take_profit - entry_price)
 
     elif (trend_15m == "空頭" and rsi_15m_filter and
@@ -177,8 +188,9 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
         entry_price = latest_5m['Close']
         stop_loss_price = latest_5m['BB_Mid']
         take_profit = entry_price - (latest_5m['BB_Mid'] - entry_price)
-        shares = int(risk_amount / (stop_loss_price - entry_price)) if (stop_loss_price - entry_price) > 0 else 0
-        risk = shares * (stop_loss_price - entry_price)
+        stop_loss_diff = stop_loss_price - entry_price
+        shares = int(risk_amount / stop_loss_diff) if stop_loss_diff > 0 else 0
+        risk = shares * stop_loss_diff
         reward = shares * (entry_price - take_profit)
 
     # 策略 3: RSI 反轉策略
@@ -191,8 +203,9 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
         entry_price = latest_5m['Close']
         stop_loss_price = entry_price + 1.5
         take_profit = latest_5m['BB_Mid']
-        shares = int(risk_amount / (stop_loss_price - entry_price)) if (stop_loss_price - entry_price) > 0 else 0
-        risk = shares * (stop_loss_price - entry_price)
+        stop_loss_diff = stop_loss_price - entry_price
+        shares = int(risk_amount / stop_loss_diff) if stop_loss_diff > 0 else 0
+        risk = shares * stop_loss_diff
         reward = shares * (entry_price - take_profit)
         
     elif (latest_5m['RSI'] < 30 and
@@ -204,13 +217,14 @@ def generate_trading_signal(df_5m, df_15m, capital=10000):
         entry_price = latest_5m['Close']
         stop_loss_price = entry_price - 1.5
         take_profit = latest_5m['BB_Mid']
-        shares = int(risk_amount / (entry_price - stop_loss_price)) if (entry_price - stop_loss_price) > 0 else 0
-        risk = shares * (entry_price - stop_loss_price)
+        stop_loss_diff = entry_price - stop_loss_price
+        shares = int(risk_amount / stop_loss_diff) if stop_loss_diff > 0 else 0
+        risk = shares * stop_loss_diff
         reward = shares * (take_profit - entry_price)
 
     # 確保不會產生無限風險或無效交易
-    if shares is not None and shares <= 0:
-        signal = "無交易信號"
+    if shares is None or shares <= 0:
+        return {"signal": "無交易信號", "strategy": None, "timestamp": datetime.now()}
     
     rr_ratio = reward / abs(risk) if risk and abs(risk) != 0 else float('inf') if reward else 0
 
@@ -235,53 +249,60 @@ def backtest_strategy(df_5m, df_15m, capital=10000, commission=5):
 
     trades = []
     equity = [capital]
-    active_trade = None  # 使用字典儲存活動交易的資訊
+    active_trade = None
     
     for i in range(21, len(df_5m)):
-        latest_5m = df_5m.iloc[i]
-
+        current_5m = df_5m.iloc[i]
+        
         if active_trade:
             # 檢查是否觸發止損或止盈
             if active_trade['signal'] == "做多":
-                if latest_5m['Low'] <= active_trade['stop_loss']:
-                    profit = (active_trade['stop_loss'] - active_trade['entry_price']) * active_trade['shares'] - commission
+                if current_5m['Low'] <= active_trade['stop_loss']:
+                    exit_price = active_trade['stop_loss']
+                    profit = (exit_price - active_trade['entry_price']) * active_trade['shares'] - commission
                     exit_reason = "止損"
-                elif latest_5m['High'] >= active_trade['take_profit']:
-                    profit = (active_trade['take_profit'] - active_trade['entry_price']) * active_trade['shares'] - commission
+                elif current_5m['High'] >= active_trade['take_profit']:
+                    exit_price = active_trade['take_profit']
+                    profit = (exit_price - active_trade['entry_price']) * active_trade['shares'] - commission
                     exit_reason = "止盈"
                 else:
-                    continue  # 繼續持有
+                    equity.append(equity[-1] + (current_5m['Close'] - active_trade['entry_price']) * active_trade['shares'])
+                    continue
             elif active_trade['signal'] == "做空":
-                if latest_5m['High'] >= active_trade['stop_loss']:
-                    profit = (active_trade['entry_price'] - active_trade['stop_loss']) * active_trade['shares'] - commission
+                if current_5m['High'] >= active_trade['stop_loss']:
+                    exit_price = active_trade['stop_loss']
+                    profit = (active_trade['entry_price'] - exit_price) * active_trade['shares'] - commission
                     exit_reason = "止損"
-                elif latest_5m['Low'] <= active_trade['take_profit']:
-                    profit = (active_trade['entry_price'] - active_trade['take_profit']) * active_trade['shares'] - commission
+                elif current_5m['Low'] <= active_trade['take_profit']:
+                    exit_price = active_trade['take_profit']
+                    profit = (active_trade['entry_price'] - exit_price) * active_trade['shares'] - commission
                     exit_reason = "止盈"
                 else:
-                    continue # 繼續持有
+                    equity.append(equity[-1] + (active_trade['entry_price'] - current_5m['Close']) * active_trade['shares'])
+                    continue
 
             capital += profit
             equity.append(capital)
             
-            # 記錄交易結果
             active_trade['盈虧'] = profit
             active_trade['退出原因'] = exit_reason
             trades.append(active_trade)
-            active_trade = None # 結束交易
+            active_trade = None
             
-        else: # 沒有活動交易時，生成新信號
+        else:
             prev_5m = df_5m.iloc[i - 1]
             latest_15m_idx = df_15m.index[df_15m.index <= df_5m.index[i]].max()
-            if pd.isna(latest_15m_idx): continue
+            if pd.isna(latest_15m_idx):
+                equity.append(capital)
+                continue
+            
             latest_15m = df_15m.loc[latest_15m_idx]
 
             signal_data = generate_trading_signal(df_5m.iloc[:i+1], df_15m.loc[:latest_15m_idx], capital=equity[-1])
             
             if signal_data['signal'] != "無交易信號":
-                # 開始一筆新交易
                 active_trade = {
-                    "時間": latest_5m.name,
+                    "時間": current_5m.name,
                     "策略": signal_data['strategy'],
                     "信號": signal_data['signal'],
                     "入場價": signal_data['entry_price'],
@@ -292,13 +313,15 @@ def backtest_strategy(df_5m, df_15m, capital=10000, commission=5):
                     "實現回報": signal_data['reward'],
                     "風險回報比": signal_data['rr_ratio']
                 }
+                equity.append(capital)
+            else:
+                equity.append(capital)
 
-    # 如果回測結束時仍有持倉，則以最後一根K線的收盤價平倉
     if active_trade:
         final_price = df_5m.iloc[-1]['Close']
         if active_trade['signal'] == "做多":
             profit = (final_price - active_trade['entry_price']) * active_trade['shares'] - commission
-        else: # 做空
+        else:
             profit = (active_trade['entry_price'] - final_price) * active_trade['shares'] - commission
         
         capital += profit
@@ -325,18 +348,19 @@ def analyze_results(trades, equity):
     win_trades = df_trades[df_trades['盈虧'] > 0]
     win_rate = len(win_trades) / len(df_trades)
     
-    # 避免除以零
     risks = df_trades['風險']
     rewards = df_trades['實現回報']
+    
+    # 避免除以零的風險
     rr_ratios = rewards / risks
-    rr_ratios.replace([np.inf, -np.inf], np.nan, inplace=True)
+    rr_ratios.replace([float('inf'), -float('inf')], 0, inplace=True)
     avg_rr_ratio = rr_ratios.mean() if not rr_ratios.isnull().all() else 0
     
     total_profit = df_trades['盈虧'].sum()
     equity_series = pd.Series(equity)
     cumulative_max = equity_series.cummax()
     drawdowns = (cumulative_max - equity_series) / cumulative_max
-    max_drawdown = drawdowns.max()
+    max_drawdown = drawdowns.max() if not drawdowns.empty else 0
     
     return {
         "勝率": win_rate,
@@ -349,24 +373,8 @@ def analyze_results(trades, equity):
 
 # 繪製 K 線圖
 def plot_data(df, interval="5分鐘"):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['Open'],
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close'],
-        name="K線"
-    ))
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA5'], name="EMA5", line=dict(color='blue')))
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], name="EMA20", line=dict(color='orange')))
-    fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], name="VWAP", line=dict(color='purple', dash='dash')))
-    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], name="布林上軌", line=dict(color='gray', dash='dot')))
-    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], name="布林下軌", line=dict(color='gray', dash='dot')))
-    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Mid'], name="布林中軌", line=dict(color='gray')))
-    
-    # 使用 make_subplots 來處理多個 y 軸
     from plotly.subplots import make_subplots
+    
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                         row_width=[0.2, 0.2, 0.6],  # 調整子圖高度比例
                         row_titles=['價格/指標', '成交量', 'OBV'])
@@ -412,8 +420,8 @@ def main():
     df_15m_backtest = fetch_historical_data(symbol, interval="15m", period="5d")
     
     if df_5m_backtest is not None and not df_5m_backtest.empty and df_15m_backtest is not None and not df_15m_backtest.empty:
-        df_5m_backtest = calculate_indicators(df_5m_backtest.copy()) # 使用 .copy() 避免 SettingWithCopyWarning
-        df_15m_backtest = calculate_indicators(df_15m_backtest.copy())
+        df_5m_backtest = calculate_indicators(df_5m_backtest)
+        df_15m_backtest = calculate_indicators(df_15m_backtest)
         if df_5m_backtest is not None and df_15m_backtest is not None:
             trades, equity = backtest_strategy(df_5m_backtest, df_15m_backtest)
             results = analyze_results(trades, equity)
@@ -439,17 +447,17 @@ def main():
 
     st.header("實時監控")
     
-    # 使用按鈕控制實時監控循環
-    if st.sidebar.button("開始實時監控") and not st.session_state.is_running:
+    if st.sidebar.button("開始實時監控", key="start_button") and not st.session_state.is_running:
         st.session_state.is_running = True
-        st.experimental_rerun()
-    if st.sidebar.button("停止實時監控") and st.session_state.is_running:
+        st.rerun()
+
+    if st.sidebar.button("停止實時監控", key="stop_button") and st.session_state.is_running:
         st.session_state.is_running = False
-        st.experimental_rerun()
+        st.rerun()
 
     if st.session_state.is_running:
         placeholder = st.empty()
-        while True:
+        while st.session_state.is_running:
             with placeholder.container():
                 df_5m = fetch_historical_data(symbol, interval="5m", period="1d")
                 df_15m = fetch_historical_data(symbol, interval="15m", period="1d")
@@ -459,8 +467,8 @@ def main():
                     time.sleep(refresh_interval)
                     continue
 
-                df_5m = calculate_indicators(df_5m.copy())
-                df_15m = calculate_indicators(df_15m.copy())
+                df_5m = calculate_indicators(df_5m)
+                df_15m = calculate_indicators(df_15m)
                 
                 if df_5m is None or df_15m is None:
                     st.error("指標計算失敗，跳過本次更新。")
@@ -511,7 +519,6 @@ def main():
                     st.write(f"**潛在盈利**: {signal['reward']:.2f} 美元")
                     st.write(f"**風險回報比**: {signal['rr_ratio']:.2f}")
                     
-                    # 避免重複發送 Email
                     if (st.session_state.last_signal is None or
                         st.session_state.last_signal['signal'] != signal['signal'] or
                         st.session_state.last_signal['strategy'] != signal['strategy']):
@@ -542,7 +549,7 @@ def main():
                 st.write(f"下次更新於 {datetime.now() + timedelta(seconds=refresh_interval)}")
             
             time.sleep(refresh_interval)
-            st.experimental_rerun()
+            st.rerun()
     else:
         st.info("請點擊左側「開始實時監控」按鈕以啟動監控。")
 
