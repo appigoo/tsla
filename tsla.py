@@ -10,27 +10,43 @@ def fetch_historical_data(symbol="TSLA", interval="5m", period="5d"):
         df = yf.download(symbol, interval=interval, period=period, prepost=False)
         if df.empty:
             raise ValueError("無數據返回，請檢查股票代碼或網路連線")
+        # 確保索引是 datetime
+        df.index = pd.to_datetime(df.index)
         return df
     except Exception as e:
         raise Exception(f"數據獲取失敗: {e}. 請檢查網路或 yfinance API 限制")
 
 # 計算技術指標
 def calculate_indicators(df):
-    df['EMA5'] = ta.trend.ema_indicator(df['Close'], window=5)
-    df['EMA20'] = ta.trend.ema_indicator(df['Close'], window=20)
-    df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
-    df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
-    df['Price_Volume'] = df['Typical_Price'] * df['Volume']
-    df['Cumulative_PV'] = df['Price_Volume'].cumsum()
-    df['Cumulative_Volume'] = df['Volume'].cumsum()
-    df['VWAP'] = df['Cumulative_PV'] / df['Cumulative_Volume']
-    bollinger = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-    df['BB_Upper'] = bollinger.bollinger_hband()
-    df['BB_Lower'] = bollinger.bollinger_lband()
-    df['BB_Mid'] = bollinger.bollinger_mavg()
-    df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
-    df['Volume_MA5'] = df['Volume'].rolling(window=5).mean()
-    return df
+    try:
+        # 確保數據是 1D
+        close = df['Close'].to_numpy().flatten()
+        volume = df['Volume'].to_numpy().flatten()
+        
+        df['EMA5'] = ta.trend.ema_indicator(pd.Series(close), window=5)
+        df['EMA20'] = ta.trend.ema_indicator(pd.Series(close), window=20)
+        df['RSI'] = ta.momentum.rsi(pd.Series(close), window=14)
+        
+        # VWAP
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        price_volume = typical_price * df['Volume']
+        cumulative_pv = price_volume.cumsum()
+        cumulative_volume = df['Volume'].cumsum()
+        df['VWAP'] = cumulative_pv / cumulative_volume
+        
+        # 布林帶
+        bollinger = ta.volatility.BollingerBands(pd.Series(close), window=20, window_dev=2)
+        df['BB_Upper'] = bollinger.bollinger_hband()
+        df['BB_Lower'] = bollinger.bollinger_lband()
+        df['BB_Mid'] = bollinger.bollinger_mavg()
+        
+        # OBV
+        df['OBV'] = ta.volume.on_balance_volume(pd.Series(close), pd.Series(volume))
+        df['Volume_MA5'] = df['Volume'].rolling(window=5).mean()
+        
+        return df
+    except Exception as e:
+        raise Exception(f"指標計算失敗: {e}")
 
 # 模擬交易並計算結果
 def simulate_trade(signal, df, i, shares, entry_price, stop_loss, take_profit, commission=5):
@@ -56,6 +72,9 @@ def simulate_trade(signal, df, i, shares, entry_price, stop_loss, take_profit, c
 
 # 回測策略
 def backtest_strategy(df_5m, df_15m, capital=10000, risk_per_trade=0.015, commission=5):
+    if len(df_5m) < 21 or len(df_15m) < 21:
+        raise ValueError("數據不足以計算指標（需要至少21根K線）")
+    
     trades = []
     equity = [capital]
     position_size = capital * 0.2  # 20% 資金
@@ -226,8 +245,12 @@ def main():
         return
     
     # 計算指標
-    df_5m = calculate_indicators(df_5m)
-    df_15m = calculate_indicators(df_15m)
+    try:
+        df_5m = calculate_indicators(df_5m)
+        df_15m = calculate_indicators(df_15m)
+    except Exception as e:
+        print(f"指標計算失敗: {e}")
+        return
     
     # 執行回測
     trades, equity = backtest_strategy(df_5m, df_15m)
