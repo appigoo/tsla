@@ -88,6 +88,9 @@ def send_email_alert(signal, email_config):
 
 # 生成實時交易信號
 def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
+    if len(df_5m) < 2 or len(df_15m) < 1:
+        return {"signal": "無交易信號", "strategy": None, "timestamp": datetime.now()}
+    
     latest_5m = df_5m.iloc[-1]
     prev_5m = df_5m.iloc[-2]
     latest_15m_idx = df_15m.index[df_15m.index <= df_5m.index[-1]].max()
@@ -98,8 +101,8 @@ def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
     entry_price = stop_loss = take_profit = risk = reward = rr_ratio = shares = None
     
     position_size = capital * 0.2
-    trend_15m = "多頭" if latest_15m['EMA5'] > latest_15m['EMA20'] else "空頭"
-    rsi_15m_filter = latest_15m['RSI'] < 70 if trend_15m == "多頭" else latest_15m['RSI'] > 30
+    trend_15m = "多頭" if latest_15m['EMA5'].item() > latest_15m['EMA20'].item() else "空頭"
+    rsi_15m_filter = latest_15m['RSI'].item() < 70 if trend_15m == "多頭" else latest_15m['RSI'].item() > 30
     
     if (trend_15m == "多頭" and rsi_15m_filter and
         latest_5m['Close'] > latest_5m['VWAP'] and 
@@ -168,7 +171,7 @@ def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
     elif (latest_5m['RSI'] > 70 and 
           latest_5m['Close'] > latest_5m['BB_Upper'] and 
           latest_5m['OBV'] < prev_5m['OBV'] and 
-          latest_15m['RSI'] > 60):
+          latest_15m['RSI'].item() > 60):
         signal = "做空"
         strategy = "RSI 反轉策略"
         entry_price = latest_5m['Close']
@@ -182,7 +185,7 @@ def generate_trading_signal(df_5m, df_15m, capital=10000, risk_per_trade=0.015):
     elif (latest_5m['RSI'] < 30 and 
           latest_5m['Close'] < latest_5m['BB_Lower'] and 
           latest_5m['OBV'] > prev_5m['OBV'] and 
-          latest_15m['RSI'] < 40):
+          latest_15m['RSI'].item() < 40):
         signal = "做多"
         strategy = "RSI 反轉策略"
         entry_price = latest_5m['Close']
@@ -226,8 +229,8 @@ def backtest_strategy(df_5m, df_15m, capital=10000, risk_per_trade=0.015, commis
         if active_trade:
             continue
         
-        trend_15m = "多頭" if latest_15m['EMA5'] > latest_15m['EMA20'] else "空頭"
-        rsi_15m_filter = latest_15m['RSI'] < 70 if trend_15m == "多頭" else latest_15m['RSI'] > 30
+        trend_15m = "多頭" if latest_15m['EMA5'].item() > latest_15m['EMA20'].item() else "空頭"
+        rsi_15m_filter = latest_15m['RSI'].item() < 70 if trend_15m == "多頭" else latest_15m['RSI'].item() > 30
         
         signal = "無交易信號"
         strategy = None
@@ -288,7 +291,7 @@ def backtest_strategy(df_5m, df_15m, capital=10000, risk_per_trade=0.015, commis
         elif (latest_5m['RSI'] > 70 and 
               latest_5m['Close'] > latest_5m['BB_Upper'] and 
               latest_5m['OBV'] < prev_5m['OBV'] and 
-              latest_15m['RSI'] > 60):
+              latest_15m['RSI'].item() > 60):
             signal = "做空"
             strategy = "RSI 反轉策略"
             entry_price = latest_5m['Close']
@@ -299,7 +302,7 @@ def backtest_strategy(df_5m, df_15m, capital=10000, risk_per_trade=0.015, commis
         elif (latest_5m['RSI'] < 30 and 
               latest_5m['Close'] < latest_5m['BB_Lower'] and 
               latest_5m['OBV'] > prev_5m['OBV'] and 
-              latest_15m['RSI'] < 40):
+              latest_15m['RSI'].item() < 40):
             signal = "做多"
             strategy = "RSI 反轉策略"
             entry_price = latest_5m['Close']
@@ -309,9 +312,9 @@ def backtest_strategy(df_5m, df_15m, capital=10000, risk_per_trade=0.015, commis
         
         if signal != "無交易信號":
             active_trade = True
-            profit, exit_reason = simulate_trade(signal, df_5m, i, shares, entry_price, stop_loss, take_profit)
+            profit, exit_reason = simulate_trade(signal, df_5m, i, shares, entry_price, stop_loss, take_profit, commission)
             risk = abs((entry_price - stop_loss) * shares) if signal == "做多" else abs((stop_loss - entry_price) * shares)
-            reward = profit + 5 if profit > 0 else 0
+            reward = profit + commission if profit > 0 else 0
             rr_ratio = reward / risk if risk > 0 and profit > 0 else 0
             trades.append({
                 "時間": df_5m.index[i],
@@ -450,6 +453,8 @@ def main():
                 st.subheader("回測交易詳情")
                 df_trades = pd.DataFrame(trades)
                 st.dataframe(df_trades[['時間', '策略', '信號', '入場價', '止損', '止盈', '盈虧', '風險回報比', '退出原因']])
+        else:
+            st.error("回測指標計算失敗，請檢查數據")
     else:
         st.error("無法獲取回測數據，請檢查網路或稍後重試")
     
@@ -490,10 +495,10 @@ def main():
             
             st.subheader("15分鐘K線數據（趨勢確認）")
             latest_15m = df_15m.iloc[-1]
-            st.write(f"趨勢: {'多頭' if latest_15m['EMA5'] > latest_15m['EMA20'] else '空頭'} | 時間: {df_15m.index[-1]}")
+            st.write(f"趨勢: {'多頭' if latest_15m['EMA5'].item() > latest_15m['EMA20'].item() else '空頭'} | 時間: {df_15m.index[-1]}")
             col1, col2, col3 = st.columns(3)
             col1.metric("EMA5", f"{latest_15m['EMA5']:.2f}")
-            col1.metric("EMA20", f"{latest_5m['EMA20']:.2f}")
+            col1.metric("EMA20", f"{latest_15m['EMA20']:.2f}")
             col2.metric("RSI", f"{latest_15m['RSI']:.2f}")
             col3.metric("布林上軌", f"{latest_15m['BB_Upper']:.2f}")
             col3.metric("布林下軌", f"{latest_15m['BB_Lower']:.2f}")
